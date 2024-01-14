@@ -45,7 +45,7 @@ from scipy import stats
 import pymc as pm
 
 from pymc.distributions import transforms
-from pymc.distributions.continuous import BoundedContinuous, ChiSquared, Normal
+from pymc.distributions.continuous import ChiSquared, Normal
 from pymc.distributions.dist_math import (
     betaln,
     check_parameters,
@@ -69,7 +69,7 @@ from pymc.distributions.shape_utils import (
     rv_size_is_none,
     to_tuple,
 )
-from pymc.distributions.transforms import Interval, ZeroSumTransform, _default_transform
+from pymc.distributions.transforms import ZeroSumTransform, _default_transform
 from pymc.logprob.abstract import _logprob
 from pymc.math import kron_diag, kron_dot
 from pymc.pytensorf import floatX, intX
@@ -1137,7 +1137,7 @@ class _LKJCholeskyCovBaseRV(RandomVariable):
             size = D.shape[:-1]
         flat_size = np.prod(size).astype(int)
 
-        C = LKJCorrRV._random_corr_matrix(rng=rng, n=n, eta=eta, flat_size=flat_size)
+        C = self._random_corr_matrix(rng=rng, n=n, eta=eta, flat_size=flat_size)
         D = D.reshape(flat_size, n)
         C *= D[..., :, np.newaxis] * D[..., np.newaxis, :]
 
@@ -1151,6 +1151,26 @@ class _LKJCholeskyCovBaseRV(RandomVariable):
             samples = np.reshape(samples, (*size, dist_shape))
 
         return samples
+
+    @classmethod
+    def _random_corr_matrix(cls, rng, n, eta, flat_size):
+        # original implementation in R see:
+        # https://github.com/rmcelreath/rethinking/blob/master/R/distributions.r
+
+        beta = eta - 1.0 + n / 2.0
+        r12 = 2.0 * stats.beta.rvs(a=beta, b=beta, size=flat_size, random_state=rng) - 1.0
+        P = np.full((flat_size, n, n), np.eye(n))
+        P[..., 0, 1] = r12
+        P[..., 1, 1] = np.sqrt(1.0 - r12**2)
+        for mp1 in range(2, n):
+            beta -= 0.5
+            y = stats.beta.rvs(a=mp1 / 2.0, b=beta, size=flat_size, random_state=rng)
+            z = stats.norm.rvs(loc=0, scale=1, size=(flat_size, mp1), random_state=rng)
+            z = z / np.sqrt(np.einsum("ij,ij->i", z, z))[..., np.newaxis]
+            P[..., 0:mp1, mp1] = np.sqrt(y[..., np.newaxis]) * z
+            P[..., mp1, mp1] = np.sqrt(1.0 - y)
+        C = np.einsum("...ji,...jk->...ik", P, P)
+        return C
 
 
 _ljk_cholesky_cov_base = _LKJCholeskyCovBaseRV()
@@ -1458,145 +1478,6 @@ class LKJCholeskyCov:
         return chol, corr, stds
 
 
-class LKJCorrRV(RandomVariable):
-    name = "lkjcorr"
-    ndim_supp = 1
-    ndims_params = [0, 0]
-    dtype = "floatX"
-    _print_name = ("LKJCorrRV", "\\operatorname{LKJCorrRV}")
-
-    def make_node(self, rng, size, dtype, n, eta):
-        n = pt.as_tensor_variable(n)
-        if not n.ndim == 0:
-            raise ValueError("n must be a scalar (ndim=0).")
-
-        eta = pt.as_tensor_variable(eta)
-        if not eta.ndim == 0:
-            raise ValueError("eta must be a scalar (ndim=0).")
-
-        return super().make_node(rng, size, dtype, n, eta)
-
-    def _supp_shape_from_params(self, dist_params, **kwargs):
-        n = dist_params[0]
-        dist_shape = ((n * (n - 1)) // 2,)
-        return dist_shape
-
-    @classmethod
-    def rng_fn(cls, rng, n, eta, size):
-        # We flatten the size to make operations easier, and then rebuild it
-        if size is None:
-            flat_size = 1
-        else:
-            flat_size = np.prod(size)
-
-        C = cls._random_corr_matrix(rng=rng, n=n, eta=eta, flat_size=flat_size)
-
-        triu_idx = np.triu_indices(n, k=1)
-        samples = C[..., triu_idx[0], triu_idx[1]]
-
-        if size is None:
-            samples = samples[0]
-        else:
-            dist_shape = (n * (n - 1)) // 2
-            samples = np.reshape(samples, (*size, dist_shape))
-        return samples
-
-    @classmethod
-    def _random_corr_matrix(cls, rng, n, eta, flat_size):
-        # original implementation in R see:
-        # https://github.com/rmcelreath/rethinking/blob/master/R/distributions.r
-
-        beta = eta - 1.0 + n / 2.0
-        r12 = 2.0 * stats.beta.rvs(a=beta, b=beta, size=flat_size, random_state=rng) - 1.0
-        P = np.full((flat_size, n, n), np.eye(n))
-        P[..., 0, 1] = r12
-        P[..., 1, 1] = np.sqrt(1.0 - r12**2)
-        for mp1 in range(2, n):
-            beta -= 0.5
-            y = stats.beta.rvs(a=mp1 / 2.0, b=beta, size=flat_size, random_state=rng)
-            z = stats.norm.rvs(loc=0, scale=1, size=(flat_size, mp1), random_state=rng)
-            z = z / np.sqrt(np.einsum("ij,ij->i", z, z))[..., np.newaxis]
-            P[..., 0:mp1, mp1] = np.sqrt(y[..., np.newaxis]) * z
-            P[..., mp1, mp1] = np.sqrt(1.0 - y)
-        C = np.einsum("...ji,...jk->...ik", P, P)
-        return C
-
-
-lkjcorr = LKJCorrRV()
-
-
-class MultivariateIntervalTransform(Interval):
-    name = "interval"
-
-    def log_jac_det(self, *args):
-        return super().log_jac_det(*args).sum(-1)
-
-
-# Returns list of upper triangular values
-class _LKJCorr(BoundedContinuous):
-    rv_op = lkjcorr
-
-    @classmethod
-    def dist(cls, n, eta, **kwargs):
-        n = pt.as_tensor_variable(intX(n))
-        eta = pt.as_tensor_variable(floatX(eta))
-        return super().dist([n, eta], **kwargs)
-
-    def moment(rv, *args):
-        return pt.zeros_like(rv)
-
-    def logp(value, n, eta):
-        """
-        Calculate log-probability of LKJ distribution at specified
-        value.
-
-        Parameters
-        ----------
-        value: numeric
-            Value for which log-probability is calculated.
-
-        Returns
-        -------
-        TensorVariable
-        """
-
-        if value.ndim > 1:
-            raise NotImplementedError("LKJCorr logp is only implemented for vector values (ndim=1)")
-
-        # TODO: PyTensor does not have a `triu_indices`, so we can only work with constant
-        #  n (or else find a different expression)
-        if not isinstance(n, Constant):
-            raise NotImplementedError("logp only implemented for constant `n`")
-
-        n = int(n.data)
-        shape = n * (n - 1) // 2
-        tri_index = np.zeros((n, n), dtype="int32")
-        tri_index[np.triu_indices(n, k=1)] = np.arange(shape)
-        tri_index[np.triu_indices(n, k=1)[::-1]] = np.arange(shape)
-
-        value = pt.take(value, tri_index)
-        value = pt.fill_diagonal(value, 1)
-
-        # TODO: _lkj_normalizing_constant currently requires `eta` and `n` to be constants
-        if not isinstance(eta, Constant):
-            raise NotImplementedError("logp only implemented for constant `eta`")
-        eta = float(eta.data)
-        result = _lkj_normalizing_constant(eta, n)
-        result += (eta - 1.0) * pt.log(det(value))
-        return check_parameters(
-            result,
-            value >= -1,
-            value <= 1,
-            matrix_pos_def(value),
-            eta > 0,
-        )
-
-
-@_default_transform.register(_LKJCorr)
-def lkjcorr_default_transform(op, rv):
-    return MultivariateIntervalTransform(floatX(-1.0), floatX(1.0))
-
-
 class LKJCorr:
     r"""
     The LKJ (Lewandowski, Kurowicka and Joe) log-likelihood.
@@ -1662,25 +1543,23 @@ class LKJCorr:
     """
 
     def __new__(cls, name, n, eta, *, return_matrix=False, **kwargs):
-        c_vec = _LKJCorr(name, eta=eta, n=n, **kwargs)
-        if not return_matrix:
-            return c_vec
-        else:
-            return cls.vec_to_corr_mat(c_vec, n)
+        pchol = _LKJCholeskyCov(
+            name + "_cov_pchol", eta=eta, n=n, sd_dist=pm.LogNormal.dist(), **kwargs
+        )
+        return cls.mat_or_vec(pchol, n, return_matrix)
 
     @classmethod
     def dist(cls, n, eta, *, return_matrix=False, **kwargs):
-        c_vec = _LKJCorr.dist(eta=eta, n=n, **kwargs)
-        if not return_matrix:
-            return c_vec
-        else:
-            return cls.vec_to_corr_mat(c_vec, n)
+        pchol = _LKJCholeskyCov.dist(eta=eta, n=n, sd_dist=pm.LogNormal.dist(), **kwargs)
+        return cls.mat_or_vec(pchol, n, return_matrix)
 
     @classmethod
-    def vec_to_corr_mat(cls, vec, n):
-        tri = pt.zeros(pt.concatenate([vec.shape[:-1], (n, n)]))
-        tri = pt.subtensor.set_subtensor(tri[(...,) + np.triu_indices(n, 1)], vec)
-        return tri + pt.moveaxis(tri, -2, -1) + pt.diag(pt.ones(n))
+    def mat_or_vec(cls, pchol, n, return_matrix):
+        _, corr, _ = LKJCholeskyCov.helper_deterministics(n, pchol)
+        if return_matrix:
+            return corr
+        else:
+            return corr[(...,) + np.triu_indices(n, 1)]
 
 
 class MatrixNormalRV(RandomVariable):
